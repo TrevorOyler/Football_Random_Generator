@@ -191,7 +191,7 @@ st.html("""
 .st-key-ep_controls [data-testid="stMarkdownContainer"] p {color:#1c2d4e;}
 .st-key-ep_controls [data-testid="stWidgetLabel"] p {font-weight:650;}
 .st-key-ep_controls [role="radiogroup"] {gap:1rem;}
-.ep-eyebrow {font-size:1rem;letter-spacing:2.5px;font-weight:850;
+.ep-eyebrow {font-size:.67rem;letter-spacing:2.5px;font-weight:850;
     color:#2455c7;margin-bottom:8px;}
 .ep-stats {display:flex;gap:0; margin:9px 0 11px;padding:13px 0;
     border-top:1px solid #dce3f1;border-bottom:1px solid #dce3f1;}
@@ -413,6 +413,3 @@ if missing_badges:
     with st.expander(f"Image setup: {len(missing_badges)} files to check"):
         st.write("Put these PNGs beside app.py. Initials appear until the images are available.")
         st.code(", ".join(missing_badges), language=None)
-
-
-
