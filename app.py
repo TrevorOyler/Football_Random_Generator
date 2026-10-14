@@ -4,6 +4,7 @@ Run: streamlit run app.py
 Uses Streamlit's native placeholders and progress animation, plus CSS.
 """
 
+import base64
 import io
 import random
 import time
@@ -16,6 +17,10 @@ from PIL import Image, UnidentifiedImageError
 
 st.set_page_config(page_title="The Extra Point Podcast", page_icon="🏈", layout="wide")
 APP_FOLDER = Path(__file__).resolve().parent
+
+# Change these to adjust the raffle. Timing includes preparation and frame updates.
+SHUFFLE_SECONDS = 4.0
+SHUFFLE_FRAMES = 28
 
 # Your PNGs stay beside app.py. No badges folder is required.
 teams = [
@@ -80,20 +85,59 @@ def image_bytes(filename):
     return read_image(filename, modified_ns)
 
 
+@st.cache_data(show_spinner=False)
+def badge_data_uri(filename, modified_ns):
+    """Make a small in-memory display copy; original PNGs are never changed."""
+    data = read_image(filename, modified_ns)
+    if data is None:
+        return None
+    try:
+        with Image.open(io.BytesIO(data)) as source:
+            image = source.convert("RGBA")
+            image.thumbnail((448, 448), Image.Resampling.LANCZOS)
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+    except (OSError, ValueError):
+        return None
+
+
+def badge_source(filename):
+    try:
+        modified_ns = (APP_FOLDER / filename).stat().st_mtime_ns
+    except OSError:
+        return None
+    return badge_data_uri(filename, modified_ns)
+
+
 def reset_picks():
     st.session_state.ep_selected = None
     st.session_state.ep_history = []
     st.session_state.ep_used = set()
-    st.session_state.ep_spinning = False
     st.session_state.ep_pick_count = 0
+    st.session_state.ep_draw_requested = False
 
 
-def start_spin():
-    st.session_state.ep_spinning = True
+def request_draw():
+    # Only the Generate Team button calls this callback.
+    st.session_state.ep_draw_requested = True
 
 
 if "ep_selected" not in st.session_state:
     reset_picks()
+for key, value in {
+    "ep_draw_requested": False,
+    "ep_conference": "All teams",
+    "ep_no_repeats": True,
+    "ep_animate": True,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+# Consume this one-shot request before rendering or animating anything.
+# A normal widget rerun or browser rerun cannot replay the previous draw.
+draw_requested = st.session_state.ep_draw_requested
+st.session_state.ep_draw_requested = False
 
 st.html("""
 <style>
@@ -180,6 +224,18 @@ st.html("""
     .ep-idle:before,.ep-dot,.st-key-ep_stage,.st-key-ep_stage img {
         animation:none!important;transition:none!important;}
 }
+
+/* The same card markup is used for every frame and for the final result. */
+.ep-stage-body {display:flex;flex-direction:column;align-items:center;gap:12px;}
+.ep-stage-media {height:224px;width:224px;display:flex;align-items:center;justify-content:center;}
+.ep-stage-media img {display:block;width:224px;height:224px;object-fit:contain;}
+.ep-stage-name {display:flex;align-items:center;justify-content:center;
+    width:100%;height:58px;font-size:clamp(1.35rem,2.2vw,1.85rem);}
+.ep-stage-meta {height:20px;line-height:20px;}
+.ep-track {height:3px;width:78%;background:#21375e;border-radius:2px;overflow:hidden;}
+.ep-track span {display:block;height:100%;background:#6f9aff;}
+.ep-track.is-idle {visibility:hidden;}
+.ep-status.is-final .ep-dot {background:#6f9aff;}
 </style>
 """)
 
@@ -201,57 +257,63 @@ with st.container(key="ep_brand", horizontal_alignment="center"):
 
 st.html('<div class="ep-heading"><h1>Random Team Generator</h1></div>')
 
-stage_column, control_column = st.columns([1.18, 1], gap="large")
-
-with stage_column:
-    with st.container(key="ep_stage", horizontal_alignment="center", gap="small"):
-        status_slot = st.empty()
-        badge_slot = st.empty()
-        name_slot = st.empty()
-        detail_slot = st.empty()
-        progress_slot = st.empty()
+def team_pool():
+    return [t for t in teams if st.session_state.ep_conference == "All teams"
+            or t["conference"] == st.session_state.ep_conference]
 
 
-def show_team(team=None, shuffling=False):
-    """Update the existing stage instead of adding another result below it."""
-    status = "SHUFFLING THE FIELD" if shuffling else "THE PICK IS IN" if team else "READY FOR KICKOFF"
-    status_class = " is-shuffling" if shuffling else ""
-    status_slot.html(f'<div class="ep-status{status_class}"><span class="ep-dot"></span>{status}</div>')
+def available_teams(pool):
+    return [t for t in pool if not st.session_state.ep_no_repeats
+            or t["name"] not in st.session_state.ep_used]
+
+
+def show_team(slot, team=None, progress=None):
+    """Replace image, name and status together with one complete card update."""
+    shuffling = progress is not None
     if team is None:
-        badge_slot.html('<div class="ep-idle"><span>?</span></div>')
-        name_slot.html('<div class="ep-stage-name">Who’s up next?</div>')
-        detail_slot.html('<div class="ep-stage-meta">Your next talking point is one click away.</div>')
+        status, status_class = "READY FOR KICKOFF", ""
+        artwork = '<div class="ep-idle"><span>?</span></div>'
+        name, detail = "Who’s up next?", "Your next talking point is one click away."
     else:
-        badge = image_bytes(team["logo"])
-        if badge:
-            badge_slot.image(badge, width=230)
-        else:
-            badge_slot.html(f'<div class="ep-fallback">{escape(team["abbreviation"])}</div>')
-        name_slot.html(f'<div class="ep-stage-name">{escape(team["name"])}</div>')
-        detail = f'{team["conference"]} · ' + ("Finding your next pick…" if shuffling else "Your latest pick")
-        detail_slot.html(f'<div class="ep-stage-meta">{escape(detail)}</div>')
+        status = "SHUFFLING THE FIELD" if shuffling else "THE PICK IS IN"
+        status_class = "is-shuffling" if shuffling else "is-final"
+        source = badge_source(team["logo"])
+        artwork = (
+            f'<img src="{source}" alt="{escape(team["name"], quote=True)} badge">'
+            if source else f'<div class="ep-fallback">{escape(team["abbreviation"])}</div>'
+        )
+        name = team["name"]
+        detail = f'{team["conference"]} · ' + (
+            "Finding your next pick…" if shuffling else "Your latest pick"
+        )
+    track_class = "" if shuffling else " is-idle"
+    percent = int(100 * progress) if shuffling else 0
+    slot.html(
+        '<div class="ep-stage-body">'
+        f'<div class="ep-status {status_class}"><span class="ep-dot"></span>{status}</div>'
+        f'<div class="ep-stage-media">{artwork}</div>'
+        f'<div class="ep-stage-name">{escape(name)}</div>'
+        f'<div class="ep-stage-meta">{escape(detail)}</div>'
+        f'<div class="ep-track{track_class}" aria-hidden="true"><span style="width:{percent}%"></span></div>'
+        '</div>'
+    )
 
 
-with control_column:
-    with st.container(key="ep_controls", gap="small"):
+def render_controls(slot):
+    # Render the normal controls once; they stay in place throughout the raffle.
+    with slot.container():
         st.html('<div class="ep-eyebrow">SET THE FIELD</div>')
-        conference = st.radio(
-            "Team pool", ["All teams", "NFC", "AFC"], horizontal=True,
-            key="ep_conference", disabled=st.session_state.ep_spinning,
+        st.radio("Team pool", ["All teams", "NFC", "AFC"], horizontal=True, key="ep_conference")
+        st.toggle(
+            "No repeats", key="ep_no_repeats",
+            help="Skip teams already picked in this session. Reset picks starts a fresh round.",
         )
-        no_repeats = st.toggle(
-            "No repeats", value=True, key="ep_no_repeats",
-            help="Skip every team already picked in this session. Reset picks starts a fresh round.",
-            disabled=st.session_state.ep_spinning,
+        st.toggle(
+            "Raffle animation", key="ep_animate",
+            help="A slowing shuffle before the final team. Turn off for an instant pick.",
         )
-        animate = st.toggle(
-            "Raffle animation", value=True, key="ep_animate",
-            help="Shuffle through the teams and slow down before the final pick. Turn off for an instant pick.",
-            disabled=st.session_state.ep_spinning,
-        )
-        pool = [t for t in teams if conference == "All teams" or t["conference"] == conference]
-        eligible = [t for t in pool if not no_repeats or t["name"] not in st.session_state.ep_used]
-
+        pool = team_pool()
+        eligible = available_teams(pool)
         st.html(
             '<div class="ep-stats">'
             f'<div class="ep-stat"><strong>{len(pool)}</strong><span>IN THE POOL</span></div>'
@@ -261,60 +323,96 @@ with control_column:
         )
         with st.container(key="ep_generate"):
             st.button(
-                "Picking your team…" if st.session_state.ep_spinning else "🏈 Generate Team",
-                key="ep_spin_button", type="primary", width="stretch",
-                disabled=st.session_state.ep_spinning or not eligible, on_click=start_spin,
+                "Generate Team", key="ep_spin_button", type="primary", width="stretch",
+                disabled=not eligible, on_click=request_draw,
             )
         with st.container(key="ep_reset"):
             st.button(
                 "Reset picks", key="ep_reset_button", width="stretch", on_click=reset_picks,
-                disabled=st.session_state.ep_spinning or st.session_state.ep_pick_count == 0,
+                disabled=st.session_state.ep_pick_count == 0,
             )
         if not eligible:
             st.info("Every team in this pool has been picked. Reset picks, change the pool, or turn off No repeats.")
+        history_slot = st.empty()
+    return history_slot
 
-        if st.session_state.ep_history:
-            recent = list(reversed(st.session_state.ep_history[-4:]))
-            chips = "".join(
-                f'<span class="ep-chip{" newest" if i == 0 else ""}">{escape(t["name"])}</span>'
-                for i, t in enumerate(recent)
-            )
-            st.html('<div class="ep-history-label">RECENT PICKS · NEWEST FIRST</div>'
-                    f'<div class="ep-history">{chips}</div>')
 
-show_team(st.session_state.ep_selected)
+def show_history(slot, history):
+    if not history:
+        slot.empty()
+        return
+    recent = list(reversed(history[-4:]))
+    chips = "".join(
+        f'<span class="ep-chip{" newest" if i == 0 else ""}">{escape(t["name"])}</span>'
+        for i, t in enumerate(recent)
+    )
+    slot.html('<div class="ep-history-label">RECENT PICKS · NEWEST FIRST</div>'
+              f'<div class="ep-history">{chips}</div>')
 
-if st.session_state.ep_spinning:
-    try:
-        if eligible:
-            # The real result is selected uniformly before the decorative animation.
-            winner = random.choice(eligible)
-            if animate and len(eligible) > 1:
-                previous = None
-                frame_count = 17
-                for frame in range(frame_count):
-                    previews = [t for t in eligible if t["name"] != previous]
-                    preview = random.choice(previews)
-                    show_team(preview, shuffling=True)
-                    previous = preview["name"]
-                    progress_slot.progress((frame + 1) / frame_count)
-                    # About 3.5 seconds: starts fast, then slows toward the reveal.
-                    time.sleep(0.045 + 0.31 * (frame / (frame_count - 1)) ** 2)
-            st.session_state.ep_selected = winner
-            st.session_state.ep_used.add(winner["name"])
-            st.session_state.ep_history = (st.session_state.ep_history + [winner.copy()])[-50:]
-            st.session_state.ep_pick_count += 1
-    finally:
-        st.session_state.ep_spinning = False
-    # Re-enable controls and update the counts without replaying the draw.
-    st.rerun()
+
+stage_column, control_column = st.columns([1.18, 1], gap="large")
+with stage_column:
+    with st.container(key="ep_stage"):
+        stage_slot = st.empty()
+with control_column:
+    with st.container(key="ep_controls", gap="small"):
+        controls_slot = st.empty()
+
+pool = team_pool()
+eligible = available_teams(pool)
+
+previous_history = list(st.session_state.ep_history)
+previous_team = st.session_state.ep_selected
+winner = None
+if draw_requested and eligible:
+    shuffle_started = time.monotonic()
+    # Store one result per explicit click. A settings rerun never replays the draw.
+    winner = random.choice(eligible)
+    st.session_state.ep_selected = winner.copy()
+    st.session_state.ep_used.add(winner["name"])
+    st.session_state.ep_history = (previous_history + [winner.copy()])[-50:]
+    st.session_state.ep_pick_count += 1
+
+# Keep the actual settings and buttons on screen, including during the shuffle.
+# Counters and button availability already reflect the draw, but history waits
+# until the reveal so it cannot give the winning team away early.
+history_slot = render_controls(controls_slot)
+show_history(history_slot, previous_history)
+show_team(stage_slot, previous_team)
+
+if winner is not None and st.session_state.ep_animate and len(eligible) > 1:
+    frame_count = max(2, int(SHUFFLE_FRAMES))
+    previous = None
+    previews = []
+    for frame in range(frame_count - 1):
+        choices = [t for t in eligible if t["name"] != previous]
+        preview = random.choice(choices)
+        previews.append(preview)
+        previous = preview["name"]
+    # Prepare lightweight embedded images before the first animation frame.
+    for team in previews + [winner]:
+        badge_source(team["logo"])
+    weights = [1 + 5 * (i / max(1, frame_count - 2)) ** 2
+               for i in range(frame_count - 1)]
+    total_weight = sum(weights)
+    elapsed_weight = 0.0
+    for frame, (preview, weight) in enumerate(zip(previews, weights)):
+        show_team(stage_slot, preview, progress=(frame + 1) / frame_count)
+        elapsed_weight += weight
+        deadline = shuffle_started + max(0.0, SHUFFLE_SECONDS) * elapsed_weight / total_weight
+        time.sleep(max(0.0, deadline - time.monotonic()))
+
+# Publish the winner ONCE. Its image stays mounted after this call.
+# No automatic rerun, clearing of image placeholders, or second final render.
+if winner is not None:
+    show_team(stage_slot, winner)
+show_history(history_slot, st.session_state.ep_history)
 
 missing_badges = [t["logo"] for t in teams if image_bytes(t["logo"]) is None]
 if missing_badges:
-    with st.expander(f"Badge setup: {len(missing_badges)} image files to check"):
-        st.write("Put these PNGs in the same folder as app.py. The generator uses abbreviations until the images are available.")
+    with st.expander(f"Image setup: {len(missing_badges)} files to check"):
+        st.write("Put these PNGs beside app.py. Initials appear until the images are available.")
         st.code(", ".join(missing_badges), language=None)
-
 
 
 
